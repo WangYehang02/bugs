@@ -1,0 +1,13 @@
+dataset: disney
+ae_dropout: 0.4
+ae_lr: 0.02
+ae_alpha: 0.6
+hid_dim:
+proto_alpha: 0.01
+weight: 1.5
+residual_scale: 20.0
+sample_steps: 50
+use_adaptive_residual_scale: false
+use_multi_score_fusion: false
+use_virtual_neighbors: false
+use_score_smoothing: false

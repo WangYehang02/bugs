@@ -1,0 +1,24 @@
+# FMGAD 运行与静态权重调参所需依赖
+# Python 建议 3.8+
+
+# 基础
+numpy
+scipy
+PyYAML
+tqdm
+
+# 深度学习
+torch
+torch-geometric
+
+# 可选：若 pip 安装 torch-geometric 报错，请按官方文档先装对应 CUDA 版本的 PyTorch
+# https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html
+
+# 微分方程（flow matching）
+torchdiffeq
+
+# 图异常检测与数据加载
+pygod
+
+# 评估
+scikit-learn

@@ -1,0 +1,17 @@
+dataset: weibo
+ae_dropout: 0.2
+ae_lr: 0.01
+ae_alpha: 1.0
+hid_dim:
+proto_alpha: 0.001
+weight: 1.5
+residual_scale: 10.0
+sample_steps: 100
+use_adaptive_residual_scale: false
+use_multi_score_fusion: false
+use_virtual_neighbors: false
+use_score_smoothing: true
+use_joint_training: true
+joint_ae_weight: 0.1
+joint_fm_weight: 1.0
+joint_warmup_epochs: 100

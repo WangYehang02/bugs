@@ -1,0 +1,13 @@
+# 数据与权重
+data/
+*.npz
+*.pt
+*.pth
+checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/

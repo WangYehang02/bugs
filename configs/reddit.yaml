@@ -1,0 +1,13 @@
+dataset: reddit
+ae_dropout: 0.3
+ae_lr: 0.02
+ae_alpha: 0.8
+hid_dim:
+proto_alpha: 0.001
+weight: 0.5
+residual_scale: 5.0
+sample_steps: 100
+use_adaptive_residual_scale: false
+use_multi_score_fusion: false
+use_virtual_neighbors: true
+use_score_smoothing: true

@@ -1,0 +1,15 @@
+# FMGAD 调参报告最优参数 (weibo AUC 0.9422)
+dataset: weibo
+ae_dropout: 0.2
+ae_lr: 0.01
+ae_alpha: 1.0
+hid_dim:
+proto_alpha: 0.001
+weight: 1.5
+residual_scale: 10.0
+sample_steps: 100
+
+use_adaptive_residual_scale: false
+use_multi_score_fusion: false
+use_virtual_neighbors: false
+use_score_smoothing: true
