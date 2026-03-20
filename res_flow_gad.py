@@ -6,13 +6,14 @@ import tqdm
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, Any, List
 
 from torchdiffeq import odeint
 
 from torch_geometric.transforms import BaseTransform
 from torch_geometric.data import Data
-from torch_geometric.utils import to_dense_adj, from_scipy_sparse_matrix
+from torch_geometric.utils import to_dense_adj, from_scipy_sparse_matrix, k_hop_subgraph
 from sklearn.metrics import auc, precision_recall_curve
 from scipy import io as scipy_io
 from scipy.sparse import issparse
@@ -70,35 +71,81 @@ def _add_virtual_knn_edges(
     device: torch.device,
 ) -> torch.Tensor:
     """
-    对度数 < degree_threshold 的节点，在嵌入空间中用 k-NN 补充虚拟边。
-    返回拼接后的 edge_index [2, E']（不重复边）。
+    对度数 < degree_threshold 的节点，在其 2-hop 范围内寻找与【其现有邻居最相似】的 k 个节点作为虚拟邻居。
+    目的：扩充邻域上下文，凸显异常节点与局部环境的不匹配程度。若 2-hop 候选不足，则触发全局兜底。
     """
     n = h.size(0)
-    # 重要：该实现会构造 n×n 相似度矩阵（O(n^2) 时间/显存）。
-    # 对超大图（如 dgraphfin 370 万节点）必须直接跳过，否则必然 OOM。
-    if n > 50000:
-        return edge_index
+
     with torch.no_grad():
+        # 1. 统计节点度数 (注意：孤立点 deg=0 无法计算邻居均值，需要跳过)
         deg = torch.zeros(n, device=device, dtype=torch.long)
         deg.scatter_add_(0, edge_index[1], torch.ones(edge_index.size(1), device=device, dtype=torch.long))
-        low_deg_mask = (deg < degree_threshold) & (deg >= 0)
-        if low_deg_mask.sum() == 0:
+
+        # 只处理 0 < deg < threshold 的节点
+        low_deg_mask = (deg < degree_threshold) & (deg > 0)
+        low_deg_nodes = low_deg_mask.nonzero(as_tuple=False).view(-1)
+
+        if low_deg_nodes.numel() == 0:
             return edge_index
-        h_norm = torch.nn.functional.normalize(h, p=2, dim=1)
-        sim = torch.mm(h_norm, h_norm.t())
-        sim.fill_diagonal_(-1e9)
-        _, idx = sim.topk(min(k, n - 1), dim=1)
+
+        h_norm = F.normalize(h, p=2, dim=1)
         new_edges = []
-        for i in range(n):
-            if not low_deg_mask[i]:
+
+        # 2. 遍历低度节点，基于“邻居的特征”寻找虚拟邻居
+        for node_idx in low_deg_nodes.tolist():
+            # 找到当前节点真实的 1-hop 邻居 (消息是从 src 传到 dst)
+            neighbors = edge_index[0][edge_index[1] == node_idx]
+
+            if neighbors.numel() == 0:
                 continue
-            for j in idx[i].tolist():
-                if j != i:
-                    new_edges.append([i, j])
+
+            # 计算现有邻居的平均特征，作为寻找虚拟邻居的 Query
+            neigh_mean_feat = h_norm[neighbors].mean(dim=0, keepdim=True)
+            neigh_mean_feat = F.normalize(neigh_mean_feat, p=2, dim=1)
+
+            # 提取 2-hop 子图节点
+            subset, _, _, _ = k_hop_subgraph(
+                node_idx,
+                num_hops=2,
+                edge_index=edge_index,
+                relabel_nodes=False,
+                num_nodes=n,
+            )
+
+            # 构造排除掩码：排除目标节点自身、以及已经是 1-hop 邻居的节点
+            exclude_mask = torch.ones(n, dtype=torch.bool, device=device)
+            exclude_mask[node_idx] = False
+            exclude_mask[neighbors] = False
+
+            # 从 2-hop 节点中筛选出合法的候选池
+            subset_candidates = subset[exclude_mask[subset]]
+
+            if subset_candidates.numel() >= k:
+                # 候选池充足：在 2-hop 范围内计算与【邻居均值】的相似度
+                candidate_feats = h_norm[subset_candidates]
+                sim_local = torch.mm(neigh_mean_feat, candidate_feats.t()).squeeze(0)
+                _, topk_idx_local = sim_local.topk(k)
+                best_candidates = subset_candidates[topk_idx_local]
+            else:
+                # 候选池不足：触发全局兜底，计算与全局所有节点的相似度
+                sim_global = torch.mm(neigh_mean_feat, h_norm.t()).squeeze(0)
+                sim_global[node_idx] = -1e9     # 排除自身
+                sim_global[neighbors] = -1e9    # 排除已有邻居
+                _, topk_idx_global = sim_global.topk(k)
+                best_candidates = topk_idx_global
+
+            # 记录新边（添加双向边以保持无向图性质，或者根据需要只加单向）
+            for cand in best_candidates.tolist():
+                new_edges.append([node_idx, cand])
+                new_edges.append([cand, node_idx])
+
         if not new_edges:
             return edge_index
-        new_edges = torch.tensor(new_edges, device=device, dtype=edge_index.dtype).t()
-        combined = torch.cat([edge_index, new_edges], dim=1)
+
+        new_edges_tensor = torch.tensor(new_edges, device=device, dtype=edge_index.dtype).t()
+        combined = torch.cat([edge_index, new_edges_tensor], dim=1)
+
+        # 剔除重复边
         combined = torch.unique(combined, dim=1)
         return combined
 

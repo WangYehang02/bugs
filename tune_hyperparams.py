@@ -16,6 +16,7 @@ import random
 import subprocess
 import tempfile
 import argparse
+import math
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -23,9 +24,10 @@ import traceback
 
 # 项目根目录
 FMGAD_ROOT = Path(__file__).resolve().parent
-FINAL_DIR = Path("/home/yehang/final")
-REPORTS_DIR = FINAL_DIR  # 报告保存到 ~/final
+FINAL_DIR = Path("/mnt/yehang") / "fmgad_outputs"
+REPORTS_DIR = FINAL_DIR  # 报告保存到 /mnt/yehang
 BEST_CONFIGS_DIR = FINAL_DIR / "best_configs"  # 最佳配置 yaml 保存目录
+RESULTS_DIR = FINAL_DIR / "results"  # 单次实验 JSON 保存目录
 LOGS_DIR = FMGAD_ROOT / "logs"
 CONFIGS_DIR = FMGAD_ROOT / "configs"
 
@@ -46,7 +48,12 @@ SEARCH_SPACE = {
     "use_adaptive_residual_scale": [False],
     "use_multi_score_fusion": [False],  # 固定关闭多评分机制
     "use_virtual_neighbors": [True, False],
-    "use_score_smoothing": [True, False],}
+    # ---- 新增调参项 ----
+    "virtual_k": [2, 5, 8],                  # 虚拟邻居补充数量 k
+    "virtual_degree_threshold": [3, 5, 10],  # 判定为低度节点的阈值
+    # ------------------
+    "use_score_smoothing": [True, False],
+}
 
 # 精简搜索空间（用于快速测试，约 16 组）
 REDUCED_SPACE = {
@@ -60,6 +67,9 @@ REDUCED_SPACE = {
     "use_adaptive_residual_scale": [False],
     "use_multi_score_fusion": [False],  # 固定关闭多评分机制
     "use_virtual_neighbors": [True, False],
+    # 快速测试：固定虚拟邻居参数
+    "virtual_k": [5],
+    "virtual_degree_threshold": [5],
     "use_score_smoothing": [True, False],
     "use_joint_training": [True],
     "joint_ae_weight": [0.05, 0.1, 0.2],
@@ -86,6 +96,27 @@ def _sample_configs(space: dict, max_configs: int, seed: int) -> list:
         return all_configs
     rng = random.Random(seed)
     return rng.sample(all_configs, max_configs)
+
+
+def _sanitize_for_json(obj):
+    """将 NaN/Inf 等不可 JSON 化的值转换为 None，递归处理 dict/list。"""
+    if obj is None:
+        return None
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, (int, str, bool)):
+        return obj
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    # 兜底：尽量转成可序列化类型
+    try:
+        if hasattr(obj, "item"):
+            return _sanitize_for_json(obj.item())
+    except Exception:
+        pass
+    return str(obj)
 
 
 def _load_base_config(dataset: str) -> dict:
@@ -119,7 +150,10 @@ def _run_single_experiment(
     result_file = None
     if result_dir:
         result_dir.mkdir(parents=True, exist_ok=True)
-        cfg_hash = hash(json.dumps(cfg, sort_keys=True)) % (10 ** 8)
+        cfg_hash = (
+            hash(json.dumps({"cfg": cfg, "seed": seed}, sort_keys=True, ensure_ascii=False))
+            % (10 ** 8)
+        )
         result_file = result_dir / f"{dataset}_{cfg_hash}.json"
 
     try:
@@ -130,8 +164,11 @@ def _run_single_experiment(
             "--device", str(device),
             "--seed", str(seed),
         ]
+        # main_train.py 的 --result-file 仅写指标，这里我们自己在末尾写“可复现 JSON”
+        metric_tmp_file = None
         if result_file:
-            cmd.extend(["--result-file", str(result_file)])
+            metric_tmp_file = str(result_file) + ".metrics_tmp.json"
+            cmd.extend(["--result-file", metric_tmp_file])
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(device)
@@ -147,57 +184,109 @@ def _run_single_experiment(
 
         os.unlink(tmp_config)
 
-        if proc.returncode != 0:
-            return {
-                "config": config_overrides,
-                "error": proc.stderr[-2000:] if proc.stderr else proc.stdout[-2000:],
-                "auc_mean": 0.0,
-            }
+        metrics = {}
+        if metric_tmp_file and os.path.exists(metric_tmp_file):
+            with open(metric_tmp_file, "r") as f:
+                metrics = json.load(f)
+            try:
+                os.unlink(metric_tmp_file)
+            except Exception:
+                pass
 
-        if result_file and result_file.exists():
-            with open(result_file, "r") as f:
-                out = json.load(f)
+        err_tail = (proc.stderr or proc.stdout or "")[-4000:]
+        ok = proc.returncode == 0 and bool(metrics)
+
+        # 写“可复现 JSON”：包含 base+overrides 合成后的完整 cfg、seed、以及指标（含 auc）
+        if result_file:
+            payload = {
+                "dataset": dataset,
+                "seed": seed,
+                "config": cfg,  # 完整配置（可直接复现）
+                "overrides": config_overrides,  # 本次调参覆盖项（便于阅读）
+                "metrics": _sanitize_for_json(metrics),
+                "returncode": proc.returncode,
+                "ok": bool(ok),
+                "error_tail": err_tail if not ok else None,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "device": device,
+            }
+            with open(result_file, "w", encoding="utf-8") as f:
+                json.dump(_sanitize_for_json(payload), f, indent=2, ensure_ascii=False, allow_nan=False)
+
+        if ok:
             return {
                 "config": config_overrides,
-                "auc_mean": out.get("auc_mean", 0.0),
-                "auc_std": out.get("auc_std", 0.0),
-                "ap_mean": out.get("ap_mean", 0.0),
+                "seed": seed,
+                "auc_mean": metrics.get("auc_mean", 0.0),
+                "auc_std": metrics.get("auc_std", 0.0),
+                "ap_mean": metrics.get("ap_mean", 0.0),
             }
         else:
-            # 解析 stdout 中的 AUC（备用）
             return {
                 "config": config_overrides,
+                "seed": seed,
                 "auc_mean": 0.0,
-                "error": "No result file",
+                "error": err_tail or "Unknown error",
             }
     except subprocess.TimeoutExpired:
         try:
             os.unlink(tmp_config)
         except Exception:
             pass
-        return {"config": config_overrides, "error": "Timeout", "auc_mean": 0.0}
+        # 超时也落盘（若有 result_file）
+        if result_file:
+            payload = {
+                "dataset": dataset,
+                "seed": seed,
+                "config": cfg,
+                "overrides": config_overrides,
+                "metrics": {},
+                "returncode": None,
+                "ok": False,
+                "error_tail": "Timeout",
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "device": device,
+            }
+            with open(result_file, "w", encoding="utf-8") as f:
+                json.dump(_sanitize_for_json(payload), f, indent=2, ensure_ascii=False, allow_nan=False)
+        return {"config": config_overrides, "seed": seed, "error": "Timeout", "auc_mean": 0.0}
     except Exception as e:
         try:
             os.unlink(tmp_config)
         except Exception:
             pass
+        if result_file:
+            payload = {
+                "dataset": dataset,
+                "seed": seed,
+                "config": cfg,
+                "overrides": config_overrides,
+                "metrics": {},
+                "returncode": None,
+                "ok": False,
+                "error_tail": str(e) + "\n" + traceback.format_exc(),
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "device": device,
+            }
+            with open(result_file, "w", encoding="utf-8") as f:
+                json.dump(_sanitize_for_json(payload), f, indent=2, ensure_ascii=False, allow_nan=False)
         return {
             "config": config_overrides,
+            "seed": seed,
             "error": str(e) + "\n" + traceback.format_exc(),
             "auc_mean": 0.0,
         }
 
 
-def _tune_dataset(args):
+def _tune_dataset_shard(args):
     """
-    对单个数据集进行调参，在指定 GPU 上顺序运行所有配置。
-    args: (dataset, device, search_space, seed, result_dir, max_configs)
+    对单个数据集的一部分配置进行调参，在指定 GPU 上顺序运行。
+    args: (dataset, device, configs, seed, result_dir)
     """
-    dataset, device, space, seed, result_dir, max_configs = args
-    configs = _sample_configs(space, max_configs, seed)
+    dataset, device, configs, seed, result_dir = args
     results = []
     for i, cfg in enumerate(configs):
-        print(f"[{dataset}] GPU{device} config {i+1}/{len(configs)}", flush=True)
+        print(f"[{dataset}] GPU{device} shard config {i+1}/{len(configs)}", flush=True)
         r = _run_single_experiment(
             dataset=dataset,
             config_overrides=cfg,
@@ -212,6 +301,38 @@ def _tune_dataset(args):
         else:
             print(f"  -> AUC: {r['auc_mean']:.4f}", flush=True)
     return dataset, results
+
+
+def _split_list(items: list, num_splits: int) -> list:
+    """尽量均匀地把 items 切成 num_splits 份（允许空）。"""
+    if num_splits <= 1:
+        return [items]
+    splits = [[] for _ in range(num_splits)]
+    for idx, it in enumerate(items):
+        splits[idx % num_splits].append(it)
+    return splits
+
+
+def _load_or_init_report_header(report_path: Path) -> tuple:
+    """
+    返回 (generated_time_str, existing_change_log_lines)。
+    若报告不存在，则生成新的生成时间并返回空修改记录。
+    """
+    if not report_path.exists():
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S"), []
+    try:
+        txt = report_path.read_text(encoding="utf-8")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S"), []
+
+    gen = None
+    change_lines = []
+    for line in txt.splitlines():
+        if line.startswith("生成时间:"):
+            gen = line.split("生成时间:", 1)[1].strip()
+        if line.startswith("- 修改时间:"):
+            change_lines.append(line)
+    return gen or datetime.now().strftime("%Y-%m-%d %H:%M:%S"), change_lines
 
 
 def main():
@@ -248,8 +369,8 @@ def main():
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=5,
-        help="并行数据集数量（每个数据集一个进程）",
+        default=8,
+        help="并行进程数（用于多 GPU 分片并行）",
     )
     parser.add_argument(
         "--max-configs",
@@ -260,8 +381,14 @@ def main():
     args = parser.parse_args()
 
     space = REDUCED_SPACE if args.reduced else SEARCH_SPACE
-    output_dir = Path(args.output_dir) if args.output_dir else LOGS_DIR / f"tune_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    # 输出统一写到 /mnt/yehang
+    FINAL_DIR.mkdir(parents=True, exist_ok=True)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    BEST_CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(args.output_dir) if args.output_dir else FINAL_DIR / f"tune_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     output_dir.mkdir(parents=True, exist_ok=True)
+    result_dir = output_dir / "results"
+    result_dir.mkdir(parents=True, exist_ok=True)
 
     # 保存搜索空间
     with open(output_dir / "search_space.json", "w") as f:
@@ -271,12 +398,22 @@ def main():
     if not datasets:
         datasets = DATASETS
 
-    # 为每个数据集分配 GPU
+    # 为每个数据集分配 GPU（按配置分片到多 GPU）
     max_configs = args.max_configs
     tasks = []
-    for i, ds in enumerate(datasets):
-        gpu = args.gpus[i % len(args.gpus)]
-        tasks.append((ds, gpu, space, args.seed, output_dir, max_configs))
+    # 每个数据集独立采样一次，再平均分到多张 GPU 上
+    num_gpus = max(1, len(args.gpus))
+    # 两个数据集时，默认把 GPU 平均分成两组（如 8 卡 -> 每个数据集 4 卡）
+    gpus_per_dataset = max(1, num_gpus // max(1, len(datasets)))
+    for di, ds in enumerate(datasets):
+        cfgs = _sample_configs(space, max_configs, args.seed + di)
+        start = di * gpus_per_dataset
+        assigned = args.gpus[start:start + gpus_per_dataset] or [args.gpus[di % num_gpus]]
+        shards = _split_list(cfgs, len(assigned))
+        for gpu, shard_cfgs in zip(assigned, shards):
+            if not shard_cfgs:
+                continue
+            tasks.append((ds, gpu, shard_cfgs, args.seed, result_dir))
 
     print("=" * 60)
     print("FMGAD 超参数调优")
@@ -287,16 +424,16 @@ def main():
 
     all_results = {}
     with ProcessPoolExecutor(max_workers=min(args.max_workers, len(tasks))) as ex:
-        futures = {ex.submit(_tune_dataset, t): t[0] for t in tasks}
+        futures = {ex.submit(_tune_dataset_shard, t): (t[0], t[1]) for t in tasks}
         for fut in as_completed(futures):
-            ds = futures[fut]
+            ds, gpu = futures[fut]
             try:
                 ds, results = fut.result()
-                all_results[ds] = results
-                print(f"[DONE] {ds}: {len(results)} configs", flush=True)
+                all_results.setdefault(ds, []).extend(results)
+                print(f"[DONE] {ds} GPU{gpu}: {len(results)} configs", flush=True)
             except Exception as e:
-                print(f"[FAIL] {ds}: {e}", flush=True)
-                all_results[ds] = []
+                print(f"[FAIL] {ds} GPU{gpu}: {e}", flush=True)
+                all_results.setdefault(ds, [])
 
     # 汇总最佳配置
     best_per_dataset = {}
@@ -323,8 +460,7 @@ def main():
             ensure_ascii=False,
         )
 
-    # 保存最佳配置 yaml 到 ~/final/best_configs/
-    BEST_CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+    # 保存最佳配置 yaml 到 /mnt/yehang/fmgad_outputs/best_configs/
     for ds in datasets:
         b = best_per_dataset.get(ds, {})
         if "error" not in b and b.get("config"):
@@ -340,12 +476,16 @@ def main():
     # 生成 Markdown 报告
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     report_path = REPORTS_DIR / "FMGAD_tuning_report.md"
+    generated_time, old_change_lines = _load_or_init_report_header(report_path)
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [
         "# FMGAD 超参数调优报告（关闭多评分机制）",
         "",
-        f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"生成时间: {generated_time}",
+        f"修改时间: {now_str}",
         f"输出目录: {output_dir}",
         f"最佳配置 yaml 目录: {BEST_CONFIGS_DIR}",
+        f"单次实验 JSON 目录: {result_dir}",
         "",
         "## 最佳 AUC 汇总",
         "",
@@ -367,6 +507,7 @@ def main():
         b = best_per_dataset.get(ds, {})
         lines.append(f"### {ds}")
         lines.append("")
+        lines.append(f"- **本段落修改时间**: {now_str}")
         if "error" in b:
             lines.append(f"- **错误**: {b['error']}")
         else:
@@ -378,6 +519,15 @@ def main():
         lines.append("")
 
     lines.extend([
+        "## 修改记录",
+        "",
+    ])
+    # 保留历史修改记录，并追加本次修改
+    for ln in old_change_lines:
+        lines.append(ln)
+    lines.append(f"- 修改时间: {now_str}（重新生成报告并写入本次结果）")
+    lines.extend([
+        "",
         "## 搜索空间",
         "",
         "```json",
