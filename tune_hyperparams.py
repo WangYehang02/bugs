@@ -18,6 +18,7 @@ import tempfile
 import argparse
 import math
 from pathlib import Path
+from typing import Optional
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import traceback
@@ -80,6 +81,14 @@ REDUCED_SPACE = {
 # 默认每组数据集最多尝试的配置数（随机采样，避免全网格爆炸）
 DEFAULT_MAX_CONFIGS = 128  # 调参更详细
 
+# 仅调 virtual_k / virtual_degree_threshold 时的网格（其余参数来自「最佳」基线 yaml）
+# 关闭分数平滑由 force_disable_score_smoothing 统一注入，不占用搜索维度
+K_ONLY_SPACE = {
+    "virtual_k": [2, 3, 5, 8, 10, 12],
+    "virtual_degree_threshold": [2, 3, 5, 8, 10],
+}
+DEFAULT_K_ONLY_MAX_CONFIGS = 512  # 全网格 6*6=36，留余量
+
 
 def _dict_product(d):
     """将搜索空间展开为所有组合的列表"""
@@ -119,7 +128,12 @@ def _sanitize_for_json(obj):
     return str(obj)
 
 
-def _load_base_config(dataset: str) -> dict:
+def _load_base_config(dataset: str, base_dir: Optional[Path] = None) -> dict:
+    if base_dir is not None:
+        p = base_dir / f"{dataset}.yaml"
+        if p.exists():
+            with open(p, "r") as f:
+                return yaml.load(f, Loader=yaml.Loader)
     cfg_path = CONFIGS_DIR / f"{dataset}.yaml"
     if not cfg_path.exists():
         raise FileNotFoundError(f"Config not found: {cfg_path}")
@@ -133,13 +147,18 @@ def _run_single_experiment(
     device: int,
     seed: int = 42,
     result_dir: Path = None,
+    base_dir: Optional[Path] = None,
+    force_disable_score_smoothing: bool = False,
 ) -> dict:
     """
     运行单次实验，返回 {config, auc_mean, auc_std, ...} 或 {error: str}
     """
-    base = _load_base_config(dataset)
+    base = _load_base_config(dataset, base_dir)
     cfg = copy.deepcopy(base)
     cfg.update(config_overrides)
+    if force_disable_score_smoothing:
+        cfg["use_score_smoothing"] = False
+        cfg["score_smoothing_alpha"] = 0.0
 
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".yaml", delete=False, dir=str(FMGAD_ROOT)
@@ -281,9 +300,9 @@ def _run_single_experiment(
 def _tune_dataset_shard(args):
     """
     对单个数据集的一部分配置进行调参，在指定 GPU 上顺序运行。
-    args: (dataset, device, configs, seed, result_dir)
+    args: (dataset, device, configs, seed, result_dir, base_dir, force_disable_score_smoothing)
     """
-    dataset, device, configs, seed, result_dir = args
+    dataset, device, configs, seed, result_dir, base_dir, force_disable_score_smoothing = args
     results = []
     for i, cfg in enumerate(configs):
         print(f"[{dataset}] GPU{device} shard config {i+1}/{len(configs)}", flush=True)
@@ -293,6 +312,8 @@ def _tune_dataset_shard(args):
             device=device,
             seed=seed,
             result_dir=result_dir,
+            base_dir=base_dir,
+            force_disable_score_smoothing=force_disable_score_smoothing,
         )
         r["dataset"] = dataset
         results.append(r)
@@ -340,8 +361,8 @@ def main():
     parser.add_argument(
         "--datasets",
         nargs="+",
-        default=DATASETS,
-        help="要调参的数据集列表",
+        default=None,
+        help="要调参的数据集列表；默认：全部 5 个；--k-only 时默认为 books enron",
     )
     parser.add_argument(
         "--gpus",
@@ -378,9 +399,32 @@ def main():
         default=DEFAULT_MAX_CONFIGS,
         help=f"每个数据集最多尝试的配置数（默认 {DEFAULT_MAX_CONFIGS}，超出则随机采样）",
     )
+    parser.add_argument(
+        "--k-only",
+        action="store_true",
+        help="仅搜索 virtual_k 与 virtual_degree_threshold；其余超参来自 --base-config-dir 下的最佳 yaml（并强制关闭分数平滑）",
+    )
+    parser.add_argument(
+        "--base-config-dir",
+        type=str,
+        default="/home/yehang/exp/configs",
+        help="--k-only 时读取 {dataset}.yaml 的目录（含 books.yaml / enron.yaml 等最佳基线）",
+    )
     args = parser.parse_args()
 
-    space = REDUCED_SPACE if args.reduced else SEARCH_SPACE
+    if args.datasets is None:
+        args.datasets = ["books", "enron"] if args.k_only else DATASETS
+
+    space = (
+        K_ONLY_SPACE
+        if args.k_only
+        else (REDUCED_SPACE if args.reduced else SEARCH_SPACE)
+    )
+    k_only_base = Path(args.base_config_dir).resolve() if args.k_only else None
+    force_disable_score_smoothing = bool(args.k_only)
+    if args.k_only and not k_only_base.exists():
+        print(f"警告: --base-config-dir 不存在 {k_only_base}，将回退到项目内 configs/", flush=True)
+        k_only_base = None
     # 输出统一写到 /mnt/yehang
     FINAL_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -413,11 +457,23 @@ def main():
         for gpu, shard_cfgs in zip(assigned, shards):
             if not shard_cfgs:
                 continue
-            tasks.append((ds, gpu, shard_cfgs, args.seed, result_dir))
+            tasks.append(
+                (
+                    ds,
+                    gpu,
+                    shard_cfgs,
+                    args.seed,
+                    result_dir,
+                    k_only_base,
+                    force_disable_score_smoothing,
+                )
+            )
 
     print("=" * 60)
-    print("FMGAD 超参数调优")
+    print("FMGAD 超参数调优" + ("（K-only，分数平滑已关）" if args.k_only else ""))
     print("数据集:", datasets)
+    if args.k_only:
+        print("基线配置目录:", k_only_base or CONFIGS_DIR)
     print("GPU:", [t[1] for t in tasks])
     print("输出目录:", output_dir)
     print("=" * 60, flush=True)
@@ -464,10 +520,13 @@ def main():
     for ds in datasets:
         b = best_per_dataset.get(ds, {})
         if "error" not in b and b.get("config"):
-            base = _load_base_config(ds)
+            base = _load_base_config(ds, k_only_base if args.k_only else None)
             full_cfg = copy.deepcopy(base)
             full_cfg.update(b["config"])
             full_cfg["use_multi_score_fusion"] = False  # 确保关闭多评分
+            if args.k_only:
+                full_cfg["use_score_smoothing"] = False
+                full_cfg["score_smoothing_alpha"] = 0.0
             yaml_path = BEST_CONFIGS_DIR / f"{ds}_best_tuned.yaml"
             with open(yaml_path, "w", encoding="utf-8") as f:
                 yaml.dump(full_cfg, f, default_flow_style=False, allow_unicode=True)
@@ -478,8 +537,13 @@ def main():
     report_path = REPORTS_DIR / "FMGAD_tuning_report.md"
     generated_time, old_change_lines = _load_or_init_report_header(report_path)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    report_title = (
+        "# FMGAD 超参数调优报告（K-only，分数平滑关闭，关闭多评分）"
+        if args.k_only
+        else "# FMGAD 超参数调优报告（关闭多评分机制）"
+    )
     lines = [
-        "# FMGAD 超参数调优报告（关闭多评分机制）",
+        report_title,
         "",
         f"生成时间: {generated_time}",
         f"修改时间: {now_str}",

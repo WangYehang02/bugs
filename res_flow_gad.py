@@ -2,6 +2,8 @@ import os
 import sys
 import math
 import csv
+import json
+import hashlib
 import tqdm
 import numpy as np
 import torch
@@ -13,7 +15,7 @@ from torchdiffeq import odeint
 
 from torch_geometric.transforms import BaseTransform
 from torch_geometric.data import Data
-from torch_geometric.utils import to_dense_adj, from_scipy_sparse_matrix, k_hop_subgraph
+from torch_geometric.utils import to_dense_adj, from_scipy_sparse_matrix
 from sklearn.metrics import auc, precision_recall_curve
 from scipy import io as scipy_io
 from scipy.sparse import issparse
@@ -69,83 +71,88 @@ def _add_virtual_knn_edges(
     degree_threshold: int,
     k: int,
     device: torch.device,
+    chunk_size: int = 5000,
 ) -> torch.Tensor:
     """
-    对度数 < degree_threshold 的节点，在其 2-hop 范围内寻找与【其现有邻居最相似】的 k 个节点作为虚拟邻居。
-    目的：扩充邻域上下文，凸显异常节点与局部环境的不匹配程度。若 2-hop 候选不足，则触发全局兜底。
+    极速优化的虚拟邻居补充机制：
+    使用全局邻居均值特征作为 Query 矩阵，通过 GPU 并行张量计算寻找相似节点，
+    彻底消除 for 循环中的 k_hop_subgraph 导致的时间阻塞。
     """
     n = h.size(0)
 
     with torch.no_grad():
-        # 1. 统计节点度数 (注意：孤立点 deg=0 无法计算邻居均值，需要跳过)
-        deg = torch.zeros(n, device=device, dtype=torch.long)
-        deg.scatter_add_(0, edge_index[1], torch.ones(edge_index.size(1), device=device, dtype=torch.long))
+        src, dst = edge_index[0], edge_index[1]
 
-        # 只处理 0 < deg < threshold 的节点
+        # 1. 统计节点度数
+        deg = torch.zeros(n, device=device, dtype=torch.long)
+        deg.scatter_add_(0, dst, torch.ones_like(dst, dtype=torch.long))
+
+        # 找出需要处理的低度节点 (排除度数为0的孤立点，因为无法计算邻居均值)
         low_deg_mask = (deg < degree_threshold) & (deg > 0)
         low_deg_nodes = low_deg_mask.nonzero(as_tuple=False).view(-1)
 
         if low_deg_nodes.numel() == 0:
             return edge_index
 
+        # 2. 全局并行计算所有节点的“邻居平均特征” (充当 Query)
+        # 通过 index_add_ 一次性完成所有消息聚合，替代 for 循环
         h_norm = F.normalize(h, p=2, dim=1)
+        neigh_sum = torch.zeros((n, h.size(1)), device=device, dtype=h.dtype)
+        neigh_sum.index_add_(0, dst, h_norm[src])
+
+        deg_clamp = deg.float().clamp_min(1.0).unsqueeze(1)
+        neigh_mean = neigh_sum / deg_clamp
+        # 得到归一化的邻居均值特征
+        neigh_mean = F.normalize(neigh_mean, p=2, dim=1)
+
         new_edges = []
 
-        # 2. 遍历低度节点，基于“邻居的特征”寻找虚拟邻居
-        for node_idx in low_deg_nodes.tolist():
-            # 找到当前节点真实的 1-hop 邻居 (消息是从 src 传到 dst)
-            neighbors = edge_index[0][edge_index[1] == node_idx]
+        # 3. 分块进行 GPU 全局相似度计算，避免 OOM
+        for start_idx in range(0, low_deg_nodes.size(0), chunk_size):
+            end_idx = min(start_idx + chunk_size, low_deg_nodes.size(0))
+            chunk_nodes = low_deg_nodes[start_idx:end_idx]
+            c_size = chunk_nodes.size(0)
 
-            if neighbors.numel() == 0:
-                continue
+            # Query: 本批次低度节点的邻居特征均值
+            query_feats = neigh_mean[chunk_nodes]
+            # 计算与全图节点的相似度
+            sim = torch.mm(query_feats, h_norm.t())
 
-            # 计算现有邻居的平均特征，作为寻找虚拟邻居的 Query
-            neigh_mean_feat = h_norm[neighbors].mean(dim=0, keepdim=True)
-            neigh_mean_feat = F.normalize(neigh_mean_feat, p=2, dim=1)
+            # 屏蔽与自身的相似度
+            sim.scatter_(1, chunk_nodes.unsqueeze(1), -1e9)
 
-            # 提取 2-hop 子图节点
-            subset, _, _, _ = k_hop_subgraph(
-                node_idx,
-                num_hops=2,
-                edge_index=edge_index,
-                relabel_nodes=False,
-                num_nodes=n,
-            )
+            # 向量化屏蔽真实的 1-hop 邻居 (避免重复造边)
+            # 建立映射: 节点ID -> 它在当前 chunk_nodes 中的相对行号
+            node_to_chunk = torch.full((n,), -1, device=device, dtype=torch.long)
+            node_to_chunk[chunk_nodes] = torch.arange(c_size, device=device)
 
-            # 构造排除掩码：排除目标节点自身、以及已经是 1-hop 邻居的节点
-            exclude_mask = torch.ones(n, dtype=torch.bool, device=device)
-            exclude_mask[node_idx] = False
-            exclude_mask[neighbors] = False
+            # 找到所有出发点在当前 chunk 内的真实边
+            valid_edges_mask = node_to_chunk[src] >= 0
+            chunk_src_idx = node_to_chunk[src[valid_edges_mask]]
+            valid_dst = dst[valid_edges_mask]
 
-            # 从 2-hop 节点中筛选出合法的候选池
-            subset_candidates = subset[exclude_mask[subset]]
+            # 将真实存在的边的相似度强行置为最小值
+            sim[chunk_src_idx, valid_dst] = -1e9
 
-            if subset_candidates.numel() >= k:
-                # 候选池充足：在 2-hop 范围内计算与【邻居均值】的相似度
-                candidate_feats = h_norm[subset_candidates]
-                sim_local = torch.mm(neigh_mean_feat, candidate_feats.t()).squeeze(0)
-                _, topk_idx_local = sim_local.topk(k)
-                best_candidates = subset_candidates[topk_idx_local]
-            else:
-                # 候选池不足：触发全局兜底，计算与全局所有节点的相似度
-                sim_global = torch.mm(neigh_mean_feat, h_norm.t()).squeeze(0)
-                sim_global[node_idx] = -1e9     # 排除自身
-                sim_global[neighbors] = -1e9    # 排除已有邻居
-                _, topk_idx_global = sim_global.topk(k)
-                best_candidates = topk_idx_global
+            # 并行获取 Top-K
+            _, topk_idx = sim.topk(min(k, n - 1), dim=1)
 
-            # 记录新边（添加双向边以保持无向图性质，或者根据需要只加单向）
-            for cand in best_candidates.tolist():
-                new_edges.append([node_idx, cand])
-                new_edges.append([cand, node_idx])
+            # 将结果转回 CPU 构建边列表 (双向加边保证无向图结构)
+            chunk_nodes_np = chunk_nodes.cpu().numpy()
+            topk_idx_np = topk_idx.cpu().numpy()
+
+            for i in range(c_size):
+                u = chunk_nodes_np[i]
+                for v in topk_idx_np[i]:
+                    new_edges.append([u, v])
+                    new_edges.append([v, u])
 
         if not new_edges:
             return edge_index
 
+        # 4. 合并边并去重
         new_edges_tensor = torch.tensor(new_edges, device=device, dtype=edge_index.dtype).t()
         combined = torch.cat([edge_index, new_edges_tensor], dim=1)
-
-        # 剔除重复边
         combined = torch.unique(combined, dim=1)
         return combined
 
@@ -621,6 +628,31 @@ class ResFlowGAD(BaseTransform):
         os.makedirs(save_dir, exist_ok=True)
         return save_dir
 
+    def _build_run_tag(self, dset: str) -> str:
+        """
+        基于当前实验关键超参数生成稳定签名，避免并行调参时写入同一路径导致 checkpoint 冲突。
+        """
+        payload = {
+            "dataset": dset,
+            "hid_dim": self.hid_dim,
+            "ae_dropout": self.ae_dropout,
+            "ae_lr": self.ae_lr,
+            "ae_alpha": self.ae_alpha,
+            "proto_alpha": self.proto_alpha,
+            "weight": self.weight,
+            "residual_scale": self.residual_scale,
+            "sample_steps": self.sample_steps,
+            "use_adaptive_residual_scale": self.use_adaptive_residual_scale,
+            "use_multi_score_fusion": self.use_multi_score_fusion,
+            "use_virtual_neighbors": self.use_virtual_neighbors,
+            "virtual_degree_threshold": self.virtual_degree_threshold,
+            "virtual_k": self.virtual_k,
+            "use_score_smoothing": self.use_score_smoothing,
+            "score_smoothing_alpha": self.score_smoothing_alpha,
+        }
+        raw = json.dumps(payload, sort_keys=True, ensure_ascii=True)
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
+
     def _build_z(self, x: torch.Tensor, edge_index: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         构建混合 Latent Z：多尺度残差（可选）+ 自适应门控/注意力融合 + 自适应缩放（可选）。
@@ -664,10 +696,8 @@ class ResFlowGAD(BaseTransform):
         # AE
         self.ae = GraphAE(in_dim=data.num_node_features, hid_dim=self.hid_dim, dropout=self.ae_dropout).cuda()
         save_dir = self._ensure_save_dir(dset)
-        ae_path = os.path.join(
-            save_dir,
-            f"ae_drop{self.ae_dropout}_lr{self.ae_lr}_alpha{self.ae_alpha}_hid{self.hid_dim}",
-        )
+        run_tag = self._build_run_tag(dset)
+        ae_path = os.path.join(save_dir, f"run_{run_tag}")
         os.makedirs(ae_path, exist_ok=True)
 
         # 1) train AE (单次；与 v2 同口径的 loss_func / dense_adj)
@@ -1145,17 +1175,17 @@ class ResFlowGAD(BaseTransform):
         best_loss = float("inf")
         patience = 0
         proto_h = None
-        # 预先计算 proto_h 作为 fallback（用于全 NaN 时兜底保存）
+
+        # FM 阶段不更新 AE：关闭 Dropout，避免每轮 _build_z 特征抖动；并一次性冻结 z/h/r，稳定流形目标、减少重复计算
+        self.ae.eval()
         with torch.no_grad():
             x0 = data.x.cuda().to(torch.float32)
             e0 = data.edge_index.cuda()
-            _, h0, _ = self._build_z(x0, e0)
-            proto_h_init = torch.mean(h0, dim=0).detach()
+            z_fixed, h_fixed, r_final_fixed = self._build_z(x0, e0)
+            proto_h_init = torch.mean(h_fixed, dim=0).detach()
 
         for epoch in range(self.diff_epochs):
-            x = data.x.cuda().to(torch.float32)
-            edge_index = data.edge_index.cuda()
-            z, h, r_final = self._build_z(x, edge_index)
+            z, h, r_final = z_fixed, h_fixed, r_final_fixed
 
             z = self._normalize_clip(z)
             if torch.isnan(z).any() or torch.isinf(z).any():
@@ -1259,11 +1289,14 @@ class ResFlowGAD(BaseTransform):
         best_loss = float("inf")
         patience = 0
 
+        self.ae.eval()
+        with torch.no_grad():
+            x_cuda = data.x.cuda().to(torch.float32)
+            edge_index_cuda = data.edge_index.cuda()
+            z_fixed, _, _ = self._build_z(x_cuda, edge_index_cuda)
+
         for epoch in range(self.diff_epochs):
-            x = data.x.cuda().to(torch.float32)
-            edge_index = data.edge_index.cuda()
-            z, _, _ = self._build_z(x, edge_index)
-            z = self._normalize_clip(z)
+            z = self._normalize_clip(z_fixed)
             if torch.isnan(z).any() or torch.isinf(z).any():
                 continue
 
