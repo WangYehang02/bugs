@@ -657,9 +657,22 @@ class ResFlowGAD(BaseTransform):
         """
         构建混合 Latent Z：多尺度残差（可选）+ 自适应门控/注意力融合 + 自适应缩放（可选）。
         返回：z [N, 2*hid_dim], h [N, hid_dim], r_final [N, hid_dim]
+
+        虚拟邻居只扩充用于消息传递的边（丰富 r_local）；门控与自适应缩放使用「物理度数」orig_deg，
+        避免虚拟边导致度数膨胀、低度节点 alpha→1 而几乎丢弃 r_global。
         """
         h = self.ae.encode(x, edge_index)
         dev = h.device
+
+        # 在添加虚拟边之前冻结物理入度（与 edge_index 约定一致：聚合到 dst=edge_index[1]）
+        orig_deg = torch.zeros(h.size(0), device=dev, dtype=h.dtype)
+        orig_deg.index_add_(
+            0,
+            edge_index[1],
+            torch.ones(edge_index.size(1), device=dev, dtype=h.dtype),
+        )
+        orig_deg = orig_deg.unsqueeze(1)
+
         if self.use_virtual_neighbors and getattr(self, "virtual_degree_threshold", 5) is not None:
             edge_index = _add_virtual_knn_edges(
                 edge_index, h,
@@ -669,17 +682,17 @@ class ResFlowGAD(BaseTransform):
             )
 
         if getattr(self, "use_multi_scale_residual", False) and self.residual_attention is not None:
-            r_global, r_local, r_structural, deg = compute_multi_scale_residuals(h, edge_index)
+            r_global, r_local, r_structural, _ = compute_multi_scale_residuals(h, edge_index)
             r_fused = self.residual_attention([r_global, r_local, r_structural])
         else:
-            r_global, r_local, deg = compute_dual_residuals_with_degree(h, edge_index)
+            r_global, r_local, _ = compute_dual_residuals_with_degree(h, edge_index)
             bias = self.gate_module.bias.to(dev)
             sharpness = self.gate_module.sharpness.to(dev)
-            alpha = torch.sigmoid((deg - bias) * sharpness)
+            alpha = torch.sigmoid((orig_deg - bias) * sharpness)
             r_fused = alpha * r_local + (1.0 - alpha) * r_global
 
         if getattr(self, "use_adaptive_residual_scale", False):
-            scale = adaptive_residual_scale_fn(deg, base_scale=self.residual_scale)
+            scale = adaptive_residual_scale_fn(orig_deg, base_scale=self.residual_scale)
             r_final = r_fused * scale
         else:
             r_final = r_fused * self.residual_scale
