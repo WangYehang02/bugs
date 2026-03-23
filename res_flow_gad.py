@@ -74,84 +74,76 @@ def _add_virtual_knn_edges(
     chunk_size: int = 5000,
 ) -> torch.Tensor:
     """
-    极速优化的虚拟邻居补充机制：
-    使用全局邻居均值特征作为 Query 矩阵，通过 GPU 并行张量计算寻找相似节点，
-    彻底消除 for 循环中的 k_hop_subgraph 导致的时间阻塞。
+    终极修复版虚拟邻居机制（严格单向 + 自身 Query）：
+    1. 包含度数为 0 的孤立点（它们也是需要救济的低度节点）
+    2. Query 使用节点自身特征 h（而不是 neigh_mean）
+    3. 虚拟边严格单向，仅添加 [src=v, dst=u]，不添加 [u, v]
     """
     n = h.size(0)
+    if n == 0 or k <= 0:
+        return edge_index
 
     with torch.no_grad():
         src, dst = edge_index[0], edge_index[1]
 
-        # 1. 统计节点度数
+        # 1) 统计节点入度（dst 接收消息，对应后续 neigh_mean / residual 聚合约定）
         deg = torch.zeros(n, device=device, dtype=torch.long)
         deg.scatter_add_(0, dst, torch.ones_like(dst, dtype=torch.long))
 
-        # 找出需要处理的低度节点 (排除度数为0的孤立点，因为无法计算邻居均值)
-        low_deg_mask = (deg < degree_threshold) & (deg > 0)
+        # 2) 低度节点：包含 deg=0 孤立点
+        low_deg_mask = deg < degree_threshold
         low_deg_nodes = low_deg_mask.nonzero(as_tuple=False).view(-1)
-
         if low_deg_nodes.numel() == 0:
             return edge_index
 
-        # 2. 全局并行计算所有节点的“邻居平均特征” (充当 Query)
-        # 通过 index_add_ 一次性完成所有消息聚合，替代 for 循环
         h_norm = F.normalize(h, p=2, dim=1)
-        neigh_sum = torch.zeros((n, h.size(1)), device=device, dtype=h.dtype)
-        neigh_sum.index_add_(0, dst, h_norm[src])
+        k_eff = min(k, n - 1)
+        if k_eff <= 0:
+            return edge_index
 
-        deg_clamp = deg.float().clamp_min(1.0).unsqueeze(1)
-        neigh_mean = neigh_sum / deg_clamp
-        # 得到归一化的邻居均值特征
-        neigh_mean = F.normalize(neigh_mean, p=2, dim=1)
+        new_edges_src = []
+        new_edges_dst = []
 
-        new_edges = []
-
-        # 3. 分块进行 GPU 全局相似度计算，避免 OOM
+        # 3) 分块做全局相似度计算：sim: [c_size, n]
         for start_idx in range(0, low_deg_nodes.size(0), chunk_size):
             end_idx = min(start_idx + chunk_size, low_deg_nodes.size(0))
             chunk_nodes = low_deg_nodes[start_idx:end_idx]
             c_size = chunk_nodes.size(0)
 
-            # Query: 本批次低度节点的邻居特征均值
-            query_feats = neigh_mean[chunk_nodes]
-            # 计算与全图节点的相似度
-            sim = torch.mm(query_feats, h_norm.t())
+            # Query：严格使用自身特征（chunk_nodes 的 h）
+            query_feats = h_norm[chunk_nodes]  # [c_size, D]
+            sim = torch.mm(query_feats, h_norm.t())  # [c_size, n]
 
-            # 屏蔽与自身的相似度
+            # 屏蔽 chunk_nodes 自身的相似度
             sim.scatter_(1, chunk_nodes.unsqueeze(1), -1e9)
 
-            # 向量化屏蔽真实的 1-hop 邻居 (避免重复造边)
-            # 建立映射: 节点ID -> 它在当前 chunk_nodes 中的相对行号
+            # 4) 屏蔽现有真实边：如果已经有 src=v -> dst=u，则不再允许把 v 作为 u 的虚拟来源
             node_to_chunk = torch.full((n,), -1, device=device, dtype=torch.long)
             node_to_chunk[chunk_nodes] = torch.arange(c_size, device=device)
 
-            # 找到所有出发点在当前 chunk 内的真实边
-            valid_edges_mask = node_to_chunk[src] >= 0
-            chunk_src_idx = node_to_chunk[src[valid_edges_mask]]
-            valid_dst = dst[valid_edges_mask]
+            valid_dst_mask = node_to_chunk[dst] >= 0
+            if valid_dst_mask.any():
+                chunk_dst_row = node_to_chunk[dst[valid_dst_mask]]  # 行：chunk u
+                valid_src = src[valid_dst_mask]  # 列：真实边的 src=v
+                sim[chunk_dst_row, valid_src] = -1e9
 
-            # 将真实存在的边的相似度强行置为最小值
-            sim[chunk_src_idx, valid_dst] = -1e9
+            # 并行 Top-K：对每个 u（chunk_nodes 的行）选 k_eff 个候选 v
+            _, topk_idx = sim.topk(k_eff, dim=1)  # [c_size, k_eff]
 
-            # 并行获取 Top-K
-            _, topk_idx = sim.topk(min(k, n - 1), dim=1)
+            # 5) 严格单向边：虚拟边只添加 [src=v, dst=u]
+            chunk_dst = chunk_nodes.repeat_interleave(k_eff)  # [c_size*k_eff]
+            chunk_src = topk_idx.reshape(-1)  # [c_size*k_eff]
 
-            # 将结果转回 CPU 构建边列表 (双向加边保证无向图结构)
-            chunk_nodes_np = chunk_nodes.cpu().numpy()
-            topk_idx_np = topk_idx.cpu().numpy()
+            new_edges_src.append(chunk_src)
+            new_edges_dst.append(chunk_dst)
 
-            for i in range(c_size):
-                u = chunk_nodes_np[i]
-                for v in topk_idx_np[i]:
-                    new_edges.append([u, v])
-                    new_edges.append([v, u])
-
-        if not new_edges:
+        if not new_edges_src:
             return edge_index
 
-        # 4. 合并边并去重
-        new_edges_tensor = torch.tensor(new_edges, device=device, dtype=edge_index.dtype).t()
+        new_src = torch.cat(new_edges_src, dim=0)
+        new_dst = torch.cat(new_edges_dst, dim=0)
+        new_edges_tensor = torch.stack([new_src, new_dst], dim=0)
+
         combined = torch.cat([edge_index, new_edges_tensor], dim=1)
         combined = torch.unique(combined, dim=1)
         return combined
@@ -643,6 +635,7 @@ class ResFlowGAD(BaseTransform):
             "residual_scale": self.residual_scale,
             "sample_steps": self.sample_steps,
             "use_adaptive_residual_scale": self.use_adaptive_residual_scale,
+            "use_multi_scale_residual": self.use_multi_scale_residual,
             "use_multi_score_fusion": self.use_multi_score_fusion,
             "use_virtual_neighbors": self.use_virtual_neighbors,
             "virtual_degree_threshold": self.virtual_degree_threshold,
@@ -661,6 +654,9 @@ class ResFlowGAD(BaseTransform):
         虚拟邻居只扩充用于消息传递的边（丰富 r_local）；门控与自适应缩放使用「物理度数」orig_deg，
         避免虚拟边导致度数膨胀、低度节点 alpha→1 而几乎丢弃 r_global。
         """
+        # 保存原始物理图（不含虚拟边），用于“结构残差/度数统计”的解耦
+        orig_edge_index = edge_index
+
         h = self.ae.encode(x, edge_index)
         dev = h.device
 
@@ -682,7 +678,26 @@ class ResFlowGAD(BaseTransform):
             )
 
         if getattr(self, "use_multi_scale_residual", False) and self.residual_attention is not None:
-            r_global, r_local, r_structural, _ = compute_multi_scale_residuals(h, edge_index)
+            # r_global / r_local：可以用扩充后的边（虚拟邻居只参与消息传递）
+            r_global, r_local, _ = compute_dual_residuals_with_degree(h, edge_index)
+
+            # r_structural：必须用“物理度数”，避免虚拟边改变结构通道
+            src_o, dst_o = orig_edge_index[0], orig_edge_index[1]
+            n, d = h.size(0), h.size(1)
+
+            deg_val_o = torch.zeros(n, device=dev, dtype=h.dtype)
+            deg_val_o.index_add_(0, dst_o, torch.ones_like(dst_o, device=dev, dtype=h.dtype))
+            deg_clamped_o = deg_val_o.clamp_min(1.0).unsqueeze(1)  # 与 encoder.py 保持一致的除法保护
+
+            # 邻居度数均值：E_{j in N(i)}[deg(j)]
+            deg_src_o = deg_val_o[src_o]
+            neigh_deg_sum_o = torch.zeros(n, device=dev, dtype=h.dtype)
+            neigh_deg_sum_o.index_add_(0, dst_o, deg_src_o)
+            neigh_deg_mean_o = (neigh_deg_sum_o / deg_clamped_o.squeeze(1)).unsqueeze(1)
+
+            r_structural_scalar = (deg_val_o.unsqueeze(1) - neigh_deg_mean_o).abs()  # [N,1]
+            r_structural = r_structural_scalar.expand(-1, d)  # [N,D]
+
             r_fused = self.residual_attention([r_global, r_local, r_structural])
         else:
             r_global, r_local, _ = compute_dual_residuals_with_degree(h, edge_index)
