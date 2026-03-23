@@ -648,62 +648,57 @@ class ResFlowGAD(BaseTransform):
 
     def _build_z(self, x: torch.Tensor, edge_index: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        构建混合 Latent Z：多尺度残差（可选）+ 自适应门控/注意力融合 + 自适应缩放（可选）。
-        返回：z [N, 2*hid_dim], h [N, hid_dim], r_final [N, hid_dim]
-
-        虚拟邻居只扩充用于消息传递的边（丰富 r_local）；门控与自适应缩放使用「物理度数」orig_deg，
-        避免虚拟边导致度数膨胀、低度节点 alpha→1 而几乎丢弃 r_global。
+        构建混合 Latent Z：物理图与扩充图解耦版。
+        - 虚拟邻居（严格单向 v->u）让低度节点 r_local 易被相似邻域拉平；门控在 else 分支用 augmented_deg，
+          使 alpha→1 时更信任该「降噪后」的 r_local，抑制长尾正常点假阳性。
+        - r_structural 与自适应缩放仍基于物理图 orig_deg，避免虚拟边污染结构与尺度。
         """
-        # 保存原始物理图（不含虚拟边），用于“结构残差/度数统计”的解耦
-        orig_edge_index = edge_index
-
         h = self.ae.encode(x, edge_index)
         dev = h.device
 
-        # 在添加虚拟边之前冻结物理入度（与 edge_index 约定一致：聚合到 dst=edge_index[1]）
+        # 1) 冻结物理拓扑与物理入度（dst 接收消息）
+        orig_edge_index = edge_index
         orig_deg = torch.zeros(h.size(0), device=dev, dtype=h.dtype)
         orig_deg.index_add_(
             0,
-            edge_index[1],
-            torch.ones(edge_index.size(1), device=dev, dtype=h.dtype),
+            orig_edge_index[1],
+            torch.ones(orig_edge_index.size(1), device=dev, dtype=h.dtype),
         )
         orig_deg = orig_deg.unsqueeze(1)
 
+        # 2) 虚拟邻居：只增加低度节点入边，不反向污染 hub
         if self.use_virtual_neighbors and getattr(self, "virtual_degree_threshold", 5) is not None:
             edge_index = _add_virtual_knn_edges(
-                edge_index, h,
+                orig_edge_index,
+                h,
                 self.virtual_degree_threshold,
                 getattr(self, "virtual_k", 5),
                 dev,
             )
 
         if getattr(self, "use_multi_scale_residual", False) and self.residual_attention is not None:
-            # r_global / r_local：可以用扩充后的边（虚拟邻居只参与消息传递）
-            r_global, r_local, _ = compute_dual_residuals_with_degree(h, edge_index)
+            # r_global / r_local / augmented_deg 均在扩充图上（虚拟邻居参与局部均值）
+            r_global, r_local, augmented_deg = compute_dual_residuals_with_degree(h, edge_index)
 
-            # r_structural：必须用“物理度数”，避免虚拟边改变结构通道
+            # r_structural：严格物理图
             src_o, dst_o = orig_edge_index[0], orig_edge_index[1]
             n, d = h.size(0), h.size(1)
-
-            deg_val_o = torch.zeros(n, device=dev, dtype=h.dtype)
-            deg_val_o.index_add_(0, dst_o, torch.ones_like(dst_o, device=dev, dtype=h.dtype))
-            deg_clamped_o = deg_val_o.clamp_min(1.0).unsqueeze(1)  # 与 encoder.py 保持一致的除法保护
-
-            # 邻居度数均值：E_{j in N(i)}[deg(j)]
+            deg_val_o = orig_deg.squeeze(1)
+            deg_clamped_o = deg_val_o.clamp_min(1.0).unsqueeze(1)
             deg_src_o = deg_val_o[src_o]
             neigh_deg_sum_o = torch.zeros(n, device=dev, dtype=h.dtype)
             neigh_deg_sum_o.index_add_(0, dst_o, deg_src_o)
             neigh_deg_mean_o = (neigh_deg_sum_o / deg_clamped_o.squeeze(1)).unsqueeze(1)
-
-            r_structural_scalar = (deg_val_o.unsqueeze(1) - neigh_deg_mean_o).abs()  # [N,1]
-            r_structural = r_structural_scalar.expand(-1, d)  # [N,D]
+            r_structural_scalar = (deg_val_o.unsqueeze(1) - neigh_deg_mean_o).abs()
+            r_structural = r_structural_scalar.expand(-1, d)
 
             r_fused = self.residual_attention([r_global, r_local, r_structural])
         else:
-            r_global, r_local, _ = compute_dual_residuals_with_degree(h, edge_index)
+            r_global, r_local, augmented_deg = compute_dual_residuals_with_degree(h, edge_index)
             bias = self.gate_module.bias.to(dev)
             sharpness = self.gate_module.sharpness.to(dev)
-            alpha = torch.sigmoid((orig_deg - bias) * sharpness)
+            # 门控用扩充后度数：低度节点获虚拟邻后 alpha 升高，更采纳被拉平的 r_local
+            alpha = torch.sigmoid((augmented_deg - bias) * sharpness)
             r_fused = alpha * r_local + (1.0 - alpha) * r_global
 
         if getattr(self, "use_adaptive_residual_scale", False):
