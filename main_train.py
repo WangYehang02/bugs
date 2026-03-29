@@ -73,8 +73,10 @@ def main():
         curriculum_warmup_epochs=int(cfg.get("curriculum_warmup_epochs", 100)),
         use_score_smoothing=cfg.get("use_score_smoothing", True),
         score_smoothing_alpha=float(cfg.get("score_smoothing_alpha", 0.3)),
+        flow_t_sampling=cfg.get("flow_t_sampling", "logit_normal"),
         ensemble_score=cfg.get("ensemble_score", True),
         num_trial=args.num_trial if args.num_trial is not None else int(cfg.get("num_trial", 3)),
+        exp_tag=cfg.get("exp_tag", None),
     )
 
     print("Running FMGADself on dataset:", dset, "num_trial:", model.num_trial, flush=True)
@@ -83,8 +85,11 @@ def main():
     elapsed = time.perf_counter() - t0
     print("FMGADself_TIME_SEC\t{:.1f}".format(elapsed), flush=True)
     if args.result_file:
-        with open(args.result_file, "w") as f:
-            json.dump({"dataset": dset, "time_sec": elapsed, **out}, f, indent=2)
+        payload = {"dataset": dset, "seed": int(args.seed), "time_sec": elapsed, **out}
+        if "auc_mean" in payload:
+            payload["auc"] = float(payload["auc_mean"])
+        with open(args.result_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
     return out
 
 

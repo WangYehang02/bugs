@@ -1,14 +1,12 @@
 import os
 import sys
 import math
+import time
 import csv
-import json
-import hashlib
 import tqdm
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, Any, List
 
 from torchdiffeq import odeint
@@ -71,80 +69,37 @@ def _add_virtual_knn_edges(
     degree_threshold: int,
     k: int,
     device: torch.device,
-    chunk_size: int = 5000,
 ) -> torch.Tensor:
     """
-    终极修复版虚拟邻居机制（严格单向 + 自身 Query）：
-    1. 包含度数为 0 的孤立点（它们也是需要救济的低度节点）
-    2. Query 使用节点自身特征 h（而不是 neigh_mean）
-    3. 虚拟边严格单向，仅添加 [src=v, dst=u]，不添加 [u, v]
+    对度数 < degree_threshold 的节点，在嵌入空间中用 k-NN 补充虚拟边。
+    返回拼接后的 edge_index [2, E']（不重复边）。
     """
     n = h.size(0)
-    if n == 0 or k <= 0:
+    # 重要：该实现会构造 n×n 相似度矩阵（O(n^2) 时间/显存）。
+    # 对超大图（如 dgraphfin 370 万节点）必须直接跳过，否则必然 OOM。
+    if n > 50000:
         return edge_index
-
     with torch.no_grad():
-        src, dst = edge_index[0], edge_index[1]
-
-        # 1) 统计节点入度（dst 接收消息，对应后续 neigh_mean / residual 聚合约定）
         deg = torch.zeros(n, device=device, dtype=torch.long)
-        deg.scatter_add_(0, dst, torch.ones_like(dst, dtype=torch.long))
-
-        # 2) 低度节点：包含 deg=0 孤立点
-        low_deg_mask = deg < degree_threshold
-        low_deg_nodes = low_deg_mask.nonzero(as_tuple=False).view(-1)
-        if low_deg_nodes.numel() == 0:
+        deg.scatter_add_(0, edge_index[1], torch.ones(edge_index.size(1), device=device, dtype=torch.long))
+        low_deg_mask = (deg < degree_threshold) & (deg >= 0)
+        if low_deg_mask.sum() == 0:
             return edge_index
-
-        h_norm = F.normalize(h, p=2, dim=1)
-        k_eff = min(k, n - 1)
-        if k_eff <= 0:
+        h_norm = torch.nn.functional.normalize(h, p=2, dim=1)
+        sim = torch.mm(h_norm, h_norm.t())
+        sim.fill_diagonal_(-1e9)
+        _, idx = sim.topk(min(k, n - 1), dim=1)
+        new_edges = []
+        for i in range(n):
+            if not low_deg_mask[i]:
+                continue
+            for j in idx[i].tolist():
+                if j != i:
+                    new_edges.append([i, j])
+        if not new_edges:
             return edge_index
-
-        new_edges_src = []
-        new_edges_dst = []
-
-        # 3) 分块做全局相似度计算：sim: [c_size, n]
-        for start_idx in range(0, low_deg_nodes.size(0), chunk_size):
-            end_idx = min(start_idx + chunk_size, low_deg_nodes.size(0))
-            chunk_nodes = low_deg_nodes[start_idx:end_idx]
-            c_size = chunk_nodes.size(0)
-
-            # Query：严格使用自身特征（chunk_nodes 的 h）
-            query_feats = h_norm[chunk_nodes]  # [c_size, D]
-            sim = torch.mm(query_feats, h_norm.t())  # [c_size, n]
-
-            # 屏蔽 chunk_nodes 自身的相似度
-            sim.scatter_(1, chunk_nodes.unsqueeze(1), -1e9)
-
-            # 4) 屏蔽现有真实边：如果已经有 src=v -> dst=u，则不再允许把 v 作为 u 的虚拟来源
-            node_to_chunk = torch.full((n,), -1, device=device, dtype=torch.long)
-            node_to_chunk[chunk_nodes] = torch.arange(c_size, device=device)
-
-            valid_dst_mask = node_to_chunk[dst] >= 0
-            if valid_dst_mask.any():
-                chunk_dst_row = node_to_chunk[dst[valid_dst_mask]]  # 行：chunk u
-                valid_src = src[valid_dst_mask]  # 列：真实边的 src=v
-                sim[chunk_dst_row, valid_src] = -1e9
-
-            # 并行 Top-K：对每个 u（chunk_nodes 的行）选 k_eff 个候选 v
-            _, topk_idx = sim.topk(k_eff, dim=1)  # [c_size, k_eff]
-
-            # 5) 严格单向边：虚拟边只添加 [src=v, dst=u]
-            chunk_dst = chunk_nodes.repeat_interleave(k_eff)  # [c_size*k_eff]
-            chunk_src = topk_idx.reshape(-1)  # [c_size*k_eff]
-
-            new_edges_src.append(chunk_src)
-            new_edges_dst.append(chunk_dst)
-
-        if not new_edges_src:
-            return edge_index
-
-        new_src = torch.cat(new_edges_src, dim=0)
-        new_dst = torch.cat(new_edges_dst, dim=0)
-        new_edges_tensor = torch.stack([new_src, new_dst], dim=0)
-
-        combined = torch.cat([edge_index, new_edges_tensor], dim=1)
+        new_edges = torch.tensor(new_edges, device=device, dtype=edge_index.dtype).t()
+        combined = torch.cat([edge_index, new_edges], dim=1)
         combined = torch.unique(combined, dim=1)
         return combined
 
@@ -213,9 +168,12 @@ class ResFlowGAD(BaseTransform):
         # 后处理：分数平滑
         use_score_smoothing: bool = True,
         score_smoothing_alpha: float = 0.3,
+        # Flow matching 时间采样策略：logit_normal / uniform
+        flow_t_sampling: str = "logit_normal",
         # 集成：多 trial 取平均分数（在 forward 里已做 3 trial，可选平均分数）
         ensemble_score: bool = True,
         num_trial: int = 3,
+        exp_tag: Optional[str] = None,
     ):
         self.name = name
         self.num_trial = num_trial
@@ -248,7 +206,9 @@ class ResFlowGAD(BaseTransform):
         self.curriculum_warmup_epochs = curriculum_warmup_epochs
         self.use_score_smoothing = use_score_smoothing
         self.score_smoothing_alpha = score_smoothing_alpha
+        self.flow_t_sampling = flow_t_sampling
         self.ensemble_score = ensemble_score
+        self.exp_tag = exp_tag
 
         self.ae_dropout = ae_dropout
         self.ae_lr = ae_lr
@@ -615,94 +575,39 @@ class ResFlowGAD(BaseTransform):
         return Data(x=x, edge_index=edge_index, y=y)
 
     def _ensure_save_dir(self, dset: str):
-        # 运行目录即项目目录（FMselfv1 或 FMGADself），模型保存到 cwd/models
-        save_dir = os.path.join(os.getcwd(), "models", dset, "full_batch")
+        # 默认保存到 cwd/models；可通过环境变量 FMGAD_MODEL_ROOT 重定向到大容量磁盘
+        model_root = os.environ.get("FMGAD_MODEL_ROOT", os.path.join(os.getcwd(), "models"))
+        save_dir = os.path.join(model_root, dset, "full_batch")
         os.makedirs(save_dir, exist_ok=True)
         return save_dir
 
-    def _build_run_tag(self, dset: str) -> str:
-        """
-        基于当前实验关键超参数生成稳定签名，避免并行调参时写入同一路径导致 checkpoint 冲突。
-        """
-        payload = {
-            "dataset": dset,
-            "hid_dim": self.hid_dim,
-            "ae_dropout": self.ae_dropout,
-            "ae_lr": self.ae_lr,
-            "ae_alpha": self.ae_alpha,
-            "proto_alpha": self.proto_alpha,
-            "weight": self.weight,
-            "residual_scale": self.residual_scale,
-            "sample_steps": self.sample_steps,
-            "use_adaptive_residual_scale": self.use_adaptive_residual_scale,
-            "use_multi_scale_residual": self.use_multi_scale_residual,
-            "use_multi_score_fusion": self.use_multi_score_fusion,
-            "use_virtual_neighbors": self.use_virtual_neighbors,
-            "virtual_degree_threshold": self.virtual_degree_threshold,
-            "virtual_k": self.virtual_k,
-            "use_score_smoothing": self.use_score_smoothing,
-            "score_smoothing_alpha": self.score_smoothing_alpha,
-        }
-        raw = json.dumps(payload, sort_keys=True, ensure_ascii=True)
-        return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
-
     def _build_z(self, x: torch.Tensor, edge_index: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        构建混合 Latent Z：物理图与扩充图解耦版。
-        - 虚拟邻居（严格单向 v->u）让低度节点 r_local 易被相似邻域拉平；门控在 else 分支用 augmented_deg，
-          使 alpha→1 时更信任该「降噪后」的 r_local，抑制长尾正常点假阳性。
-        - r_structural 与自适应缩放仍基于物理图 orig_deg，避免虚拟边污染结构与尺度。
+        构建混合 Latent Z：多尺度残差（可选）+ 自适应门控/注意力融合 + 自适应缩放（可选）。
+        返回：z [N, 2*hid_dim], h [N, hid_dim], r_final [N, hid_dim]
         """
         h = self.ae.encode(x, edge_index)
         dev = h.device
-
-        # 1) 冻结物理拓扑与物理入度（dst 接收消息）
-        orig_edge_index = edge_index
-        orig_deg = torch.zeros(h.size(0), device=dev, dtype=h.dtype)
-        orig_deg.index_add_(
-            0,
-            orig_edge_index[1],
-            torch.ones(orig_edge_index.size(1), device=dev, dtype=h.dtype),
-        )
-        orig_deg = orig_deg.unsqueeze(1)
-
-        # 2) 虚拟邻居：只增加低度节点入边，不反向污染 hub
         if self.use_virtual_neighbors and getattr(self, "virtual_degree_threshold", 5) is not None:
             edge_index = _add_virtual_knn_edges(
-                orig_edge_index,
-                h,
+                edge_index, h,
                 self.virtual_degree_threshold,
                 getattr(self, "virtual_k", 5),
                 dev,
             )
 
         if getattr(self, "use_multi_scale_residual", False) and self.residual_attention is not None:
-            # r_global / r_local / augmented_deg 均在扩充图上（虚拟邻居参与局部均值）
-            r_global, r_local, augmented_deg = compute_dual_residuals_with_degree(h, edge_index)
-
-            # r_structural：严格物理图
-            src_o, dst_o = orig_edge_index[0], orig_edge_index[1]
-            n, d = h.size(0), h.size(1)
-            deg_val_o = orig_deg.squeeze(1)
-            deg_clamped_o = deg_val_o.clamp_min(1.0).unsqueeze(1)
-            deg_src_o = deg_val_o[src_o]
-            neigh_deg_sum_o = torch.zeros(n, device=dev, dtype=h.dtype)
-            neigh_deg_sum_o.index_add_(0, dst_o, deg_src_o)
-            neigh_deg_mean_o = (neigh_deg_sum_o / deg_clamped_o.squeeze(1)).unsqueeze(1)
-            r_structural_scalar = (deg_val_o.unsqueeze(1) - neigh_deg_mean_o).abs()
-            r_structural = r_structural_scalar.expand(-1, d)
-
+            r_global, r_local, r_structural, deg = compute_multi_scale_residuals(h, edge_index)
             r_fused = self.residual_attention([r_global, r_local, r_structural])
         else:
-            r_global, r_local, augmented_deg = compute_dual_residuals_with_degree(h, edge_index)
+            r_global, r_local, deg = compute_dual_residuals_with_degree(h, edge_index)
             bias = self.gate_module.bias.to(dev)
             sharpness = self.gate_module.sharpness.to(dev)
-            # 门控用扩充后度数：低度节点获虚拟邻后 alpha 升高，更采纳被拉平的 r_local
-            alpha = torch.sigmoid((augmented_deg - bias) * sharpness)
+            alpha = torch.sigmoid((deg - bias) * sharpness)
             r_fused = alpha * r_local + (1.0 - alpha) * r_global
 
         if getattr(self, "use_adaptive_residual_scale", False):
-            scale = adaptive_residual_scale_fn(orig_deg, base_scale=self.residual_scale)
+            scale = adaptive_residual_scale_fn(deg, base_scale=self.residual_scale)
             r_final = r_fused * scale
         else:
             r_final = r_fused * self.residual_scale
@@ -719,8 +624,13 @@ class ResFlowGAD(BaseTransform):
         # AE
         self.ae = GraphAE(in_dim=data.num_node_features, hid_dim=self.hid_dim, dropout=self.ae_dropout).cuda()
         save_dir = self._ensure_save_dir(dset)
-        run_tag = self._build_run_tag(dset)
-        ae_path = os.path.join(save_dir, f"run_{run_tag}")
+        ae_path = os.path.join(
+            save_dir,
+            f"ae_drop{self.ae_dropout}_lr{self.ae_lr}_alpha{self.ae_alpha}_hid{self.hid_dim}",
+        )
+        # 并发运行时避免多个进程写入同一 checkpoint 文件
+        run_tag = self.exp_tag if self.exp_tag else f"run_{os.getpid()}_{int(time.time() * 1000)}"
+        ae_path = os.path.join(ae_path, run_tag)
         os.makedirs(ae_path, exist_ok=True)
 
         # 1) train AE (单次；与 v2 同口径的 loss_func / dense_adj)
@@ -1198,17 +1108,17 @@ class ResFlowGAD(BaseTransform):
         best_loss = float("inf")
         patience = 0
         proto_h = None
-
-        # FM 阶段不更新 AE：关闭 Dropout，避免每轮 _build_z 特征抖动；并一次性冻结 z/h/r，稳定流形目标、减少重复计算
-        self.ae.eval()
+        # 预先计算 proto_h 作为 fallback（用于全 NaN 时兜底保存）
         with torch.no_grad():
             x0 = data.x.cuda().to(torch.float32)
             e0 = data.edge_index.cuda()
-            z_fixed, h_fixed, r_final_fixed = self._build_z(x0, e0)
-            proto_h_init = torch.mean(h_fixed, dim=0).detach()
+            _, h0, _ = self._build_z(x0, e0)
+            proto_h_init = torch.mean(h0, dim=0).detach()
 
         for epoch in range(self.diff_epochs):
-            z, h, r_final = z_fixed, h_fixed, r_final_fixed
+            x = data.x.cuda().to(torch.float32)
+            edge_index = data.edge_index.cuda()
+            z, h, r_final = self._build_z(x, edge_index)
 
             z = self._normalize_clip(z)
             if torch.isnan(z).any() or torch.isinf(z).any():
@@ -1312,14 +1222,11 @@ class ResFlowGAD(BaseTransform):
         best_loss = float("inf")
         patience = 0
 
-        self.ae.eval()
-        with torch.no_grad():
-            x_cuda = data.x.cuda().to(torch.float32)
-            edge_index_cuda = data.edge_index.cuda()
-            z_fixed, _, _ = self._build_z(x_cuda, edge_index_cuda)
-
         for epoch in range(self.diff_epochs):
-            z = self._normalize_clip(z_fixed)
+            x = data.x.cuda().to(torch.float32)
+            edge_index = data.edge_index.cuda()
+            z, _, _ = self._build_z(x, edge_index)
+            z = self._normalize_clip(z)
             if torch.isnan(z).any() or torch.isinf(z).any():
                 continue
 
@@ -1328,7 +1235,7 @@ class ResFlowGAD(BaseTransform):
                 self.dm_proto.velocity_fn,
                 z,
                 proto_context,
-                t_sampling="logit_normal",
+                t_sampling=self.flow_t_sampling,
                 reduction="mean",
             )
 

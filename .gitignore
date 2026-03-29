@@ -5,12 +5,6 @@ data/
 *.pth
 checkpoints/
 
-# 调参/运行产生的临时 yaml
-tmp*.yaml
-
-# 本地权重目录（常为指向大盘的软链）
-models/
-
 # Python
 __pycache__/
 *.py[cod]
