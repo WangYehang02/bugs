@@ -231,6 +231,8 @@ class ResFlowGAD(BaseTransform):
             return load_dgraph_data()
         if dset == "yelpchi":
             return self._load_yelpchi()
+        if dset in ("questions", "hetero_questions"):
+            return self._load_heterophilous_questions()
         if dset == "elliptic":
             return self._load_elliptic()
         if dset == "twitter":
@@ -325,7 +327,7 @@ class ResFlowGAD(BaseTransform):
         )
 
     def _load_yelpchi(self):
-        """Load YelpChi: try local .mat, then pygod, then local .pt, then PyG Yelp (GraphSAINT) as fallback."""
+        """Load YelpChi: 本地 .mat -> CARE-GNN 官方 zip -> pygod（已下线 yelpchi.pt）-> 本地 .pt -> PyG Yelp。"""
         # 1) 优先使用 FMGAD 目录下的 YelpChi.mat
         for root in [os.getcwd(), FMGAD_ROOT]:
             for sub in ["", "datasets", "datasets/YelpChi"]:
@@ -333,6 +335,33 @@ class ResFlowGAD(BaseTransform):
                 mat_path = os.path.join(folder, "YelpChi.mat")
                 if os.path.isfile(mat_path):
                     return self._load_mat_data(mat_path)
+
+        # 2) CARE-GNN 数据包（pygod-team/data 仓库已不再提供 yelpchi.pt.zip，此为常用镜像）
+        care_root = os.path.join(FMGAD_ROOT, "datasets", "YelpChi")
+        care_zip = os.path.join(care_root, "YelpChi.zip")
+        care_extract = os.path.join(care_root, "YelpChi_care_gnn")
+        care_url = "https://github.com/YingtongDou/CARE-GNN/raw/master/data/YelpChi.zip"
+        try:
+            import zipfile
+            import urllib.request
+
+            os.makedirs(care_root, exist_ok=True)
+            if not os.path.isfile(care_zip):
+                if self.verbose:
+                    print("Downloading YelpChi.zip from CARE-GNN (YingtongDou/CARE-GNN) ...", flush=True)
+                urllib.request.urlretrieve(care_url, care_zip)
+            if not os.path.isdir(care_extract):
+                os.makedirs(care_extract, exist_ok=True)
+                with zipfile.ZipFile(care_zip, "r") as zf:
+                    zf.extractall(care_extract)
+            for r, _, files in os.walk(care_extract):
+                for fn in files:
+                    if fn.lower().endswith(".mat"):
+                        return self._load_mat_data(os.path.join(r, fn))
+        except Exception as e:
+            if self.verbose:
+                print(f"YelpChi CARE-GNN zip 路径失败: {e}", flush=True)
+
         try:
             return load_data("yelpchi")
         except RuntimeError:
@@ -353,6 +382,32 @@ class ResFlowGAD(BaseTransform):
             raise RuntimeError(
                 "YelpChi not found: put YelpChi.mat in FMGAD/ or FMGAD/datasets/ or yelpchi.pt in ~/.pygod/data/."
             ) from e
+
+    def _load_heterophilous_questions(self):
+        """Questions：torch_geometric.datasets.HeterophilousGraphDataset，首次运行自动下载 npz。"""
+        from torch_geometric.datasets import HeterophilousGraphDataset
+
+        root = os.path.join(FMGAD_ROOT, "datasets", "heterophilous")
+        dataset = HeterophilousGraphDataset(root=root, name="Questions")
+        data = dataset[0]
+        x = data.x.float()
+        edge_index = data.edge_index.long()
+        y = data.y.view(-1).long()
+        # 节点分类标签 -> 图异常检测常用约定：少数类为异常(1)，多数类为正常(0)
+        uniq, counts = torch.unique(y, return_counts=True)
+        if uniq.numel() <= 1:
+            raise RuntimeError("Questions: degenerate labels")
+        normal_val = uniq[torch.argmax(counts)]
+        y_bin = (y != normal_val).long()
+        if self.verbose:
+            n0 = int((y_bin == 0).sum().item())
+            n1 = int((y_bin == 1).sum().item())
+            print(
+                f"Questions: N={x.size(0)}, E={edge_index.size(1)}, "
+                f"normal={n0}, anomaly={n1} (minority-as-anomaly)",
+                flush=True,
+            )
+        return Data(x=x, edge_index=edge_index, y=y_bin)
 
     def _load_elliptic(self):
         """
@@ -375,7 +430,7 @@ class ResFlowGAD(BaseTransform):
         if ell_env:
             base_dirs.insert(0, ell_env)
 
-        # 3) 尝试通过 kagglehub 自动下载（需要网络与 kagglehub 依赖）
+        # 3) 尝试通过 kagglehub 自动下载（需 Python>=3.9 的 kagglehub；3.8 会导入失败被跳过）
         try:
             import kagglehub  # type: ignore
 
@@ -383,9 +438,13 @@ class ResFlowGAD(BaseTransform):
             # 官方数据目录中真正的文件夹为 elliptic_bitcoin_dataset
             kb_inner = os.path.join(kaggle_path, "elliptic_bitcoin_dataset")
             base_dirs.insert(0, kb_inner if os.path.isdir(kb_inner) else kaggle_path)
-        except Exception:
-            # kagglehub 不可用时直接跳过，后续仅尝试本地目录
-            pass
+        except Exception as e:
+            if self.verbose:
+                print(
+                    f"Elliptic: kagglehub 自动下载未使用（{type(e).__name__}: {e}）。"
+                    " 请使用 Python>=3.9 环境安装 kagglehub，或设置 ELLIPTIC_DATA_DIR / 将三份 CSV 放到 datasets/elliptic/。",
+                    flush=True,
+                )
 
         feat_path = edge_path = class_path = None
         for base in base_dirs:

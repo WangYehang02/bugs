@@ -1,5 +1,7 @@
 # 数据与权重
 data/
+datasets/YelpChi/*.zip
+datasets/YelpChi/YelpChi_care_gnn/
 *.npz
 *.pt
 *.pth

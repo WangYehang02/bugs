@@ -176,4 +176,16 @@ def get_detailed_search_space(dataset: str) -> dict:
             "weight": [1.0, 1.25, 1.5, 1.75, 2.0],
             "proto_alpha": [0.01, 0.03, 0.05, 0.08, 0.1],
         }
+    if d == "yelpchi":
+        return {
+            "ae_dropout": [0.2, 0.25, 0.3, 0.35, 0.4],
+            "ae_lr": [0.005, 0.008, 0.01, 0.012, 0.015, 0.02],
+            "ae_alpha": [0.7, 0.8, 0.9, 1.0],
+            "residual_scale": [5.0, 7.5, 10.0, 12.5, 15.0, 20.0],
+            "sample_steps": [50, 75, 100, 125, 150],
+            "weight": [0.5, 1.0, 1.5, 2.0],
+            "proto_alpha": [0.001, 0.005, 0.01, 0.02],
+            "flow_t_sampling": ["uniform", "logit_normal"],
+            "use_virtual_neighbors": [True, False],
+        }
     return get_refined_search_space(dataset)
